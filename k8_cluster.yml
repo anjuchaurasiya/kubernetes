@@ -1,0 +1,178 @@
+---
+- hosts: all
+  become: yes
+  gather_facts: yes
+  vars:
+    - kubeadm_join: ''
+  tasks:
+    - name: Check RAM and CPU number
+      assert:
+        that:
+          - ansible_memory_mb >= 3789
+          - ansible_processor_vcpus == 2
+    
+    - name: remove swap entry 
+      mount: 
+        name: swap
+        fstype: swap
+        state: absent  
+    
+    - name: disable swap
+      command: swapoff -a 
+      when: ansible_swaptotal_mb > 0   
+
+    - name: Stop and disable Firewalld
+      service:
+        name: firewalld
+        state: stopped
+        enabled: no  
+
+    - name: Disable selinux
+      selinux:
+        state: disabled    
+
+# set br_netfliter first before enabling the bridge           
+    - name: Add br_netfilter module
+      modprobe:
+        name: br_netfilter
+        state: present  
+    
+    - name: Update kernel values
+      sysctl:
+        name: "{{ item }}"
+        value: 1
+        state: present
+        sysctl_set: yes
+        reload: yes
+      with_items:
+        - 'net.bridge.bridge-nf-call-ip6tables'
+        - 'net.bridge.bridge-nf-call-iptables'       
+    
+    - name: IPv4 enable
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: 1
+        state: present
+        reload: yes
+        sysctl_set: yes
+
+    
+    - name: Enable docker repo
+      yum_repository:
+        name: docker-ce
+        description: docker-ce repository
+        baseurl: https://download.docker.com/linux/centos/$releasever/$basearch/stable
+        enabled: yes
+        gpgcheck: yes
+        gpgkey: https://download.docker.com/linux/centos/gpg
+        state: present
+    
+    - name: Enable kubernetes repo
+      yum_repository:
+        name: kubernetes
+        description: kubernetes repository
+        baseurl: https://packages.cloud.google.com/yum/repos/kubernetes-el7-x86_64
+        enabled: yes
+        gpgcheck: yes
+        gpgkey: https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+        state: present
+
+    - name: install NTP
+      yum:
+        name: ntp
+        state: present 
+    
+    - name: Install Docker
+      yum:
+        name: "{{ item }}"
+        state: present
+        update_cache: true
+      loop:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io   
+
+    - name: install kubernetes
+      yum:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - kubelet  #the component that runs on all of the machines in your cluster and does things like starting pods and containers
+        - kubeadm  #the command to bootstrap the cluster
+        - kubectl  #the command line util to talk to your cluster
+
+    - name: Change docker driver to systemd
+      shell: |
+        sed -i 's|/usr/bin/dockerd|/usr/bin/dockerd --exec-opt native.cgroupdriver=systemd|g' /usr/lib/systemd/system/docker.service
+        systemctl daemon-reload
+    
+    - name: Enable Services
+      service: name={{ item }} state=started enabled=yes
+      loop:
+        - docker
+        - ntpd
+        - kubelet
+      register: service_status
+
+    - debug:
+        msg: "{{ service_status }}"   
+
+
+- name: Install Kubernetes master
+  hosts: master
+  become: yes
+  tasks:
+    - name: kubeadm reset
+      shell: "kubeadm reset -f"
+
+    - name: Initialize the cluster
+      shell: kubeadm init
+      register: kubeadm_init
+
+    - name: Copy admin.conf to user's kube config
+      shell: |
+        set -x
+        whoami && pwd && echo $HOME
+        rm -rf $HOME/.kube
+        mkdir -p $HOME/.kube
+        cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+        #chown $(id -u):$(id -g) $HOME/.kube/config                  
+    
+    - name: Deploy a pod network to the cluster 
+      shell: |
+        kubectl apply -f "https://cloud.weave.works/k8s/net?k8s-version=$(kubectl version | base64 | tr -d '\n')"
+
+    - name: Installing an addon for contect switch and namespace switch
+      unarchive:
+        src: "{{ item }}"
+        dest: /usr/local/bin
+        remote_src: yes
+      loop:
+       - 'https://github.com/ahmetb/kubectx/releases/download/v0.9.4/kubectx_v0.9.4_linux_x86_64.tar.gz'
+       - 'https://github.com/ahmetb/kubectx/releases/download/v0.9.4/kubens_v0.9.4_linux_x86_64.tar.gz' 
+
+    - name: Generate token to join workers
+      shell: kubeadm token create --print-join-command
+      register: token
+
+    - name: Get the token 
+      set_fact:
+        kubeadm_join: "{{ token.stdout_lines[0] }}"
+
+    - debug:
+        var: kubeadm_join   
+
+- name: Install Kubernetes workers
+  become: true
+  hosts: worker
+  tasks:
+    - name: kubeadm reset
+      shell: "kubeadm reset -f"
+
+    - name: Join the Worker
+      shell: "{{ hostvars['master'].kubeadm_join }}" 
+      register: worker_join  
+     
+    - debug:
+        var: worker_join         
+       
