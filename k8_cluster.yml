@@ -8,7 +8,7 @@
     - name: Check RAM and CPU number
       assert:
         that:
-          - ansible_memory_mb >= 3789
+          - ansible_memory_mb.real.total >= 3789
           - ansible_processor_vcpus == 2
     
     - name: remove swap entry 
@@ -77,9 +77,9 @@
         gpgkey: https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
         state: present
 
-    - name: install NTP
+    - name: install chrony
       yum:
-        name: ntp
+        name: chrony
         state: present 
     
     - name: Install Docker
